@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -39,31 +40,23 @@ type AutoFix struct {
 }
 
 // DecodeMKGW4Auto accepts either ASCII-hex or raw bytes (we get hex).
-func DecodeMKGW4Auto(asciiOrBin []byte) (*Auto, bool, error) {
-	h := strings.ToUpper(strings.TrimSpace(string(asciiOrBin)))
+func DecodeMKGW4Auto(flagHex string, bodyHex string) (*Auto, bool, error) {
+	flag := strings.ToUpper(strings.TrimSpace(flagHex))
+
+	h := strings.ToUpper(strings.TrimSpace(string(bodyHex)))
 	h = strings.NewReplacer(" ", "", ":", "", "-", "", ".", "").Replace(h)
-	if len(h)%2 != 0 || !onlyHex(h) {
-		h = strings.ToUpper(hex.EncodeToString(asciiOrBin))
-	}
+
 	b, err := hex.DecodeString(h)
 	if err != nil {
 		return nil, false, fmt.Errorf("hex decode: %w", err)
 	}
-	if len(b) < 11 {
-		return nil, false, errors.New("frame too short")
-	}
 
-	flag := fmt.Sprintf("%02x%02x", b[1], b[2])
-	bodyLen := int(b[9])<<8 | int(b[10])
-	body := b[11:]
-	if bodyLen <= len(body) {
-		body = body[:bodyLen]
-	}
+	a := &Auto{Flag: strings.ToLower(flag), Hex: h}
 
-	a := &Auto{Flag: flag, Hex: h}
 	switch flag {
 	case "3004":
-		st, ts, err := parseStatusTLV(body)
+		log.Printf("In case 3004")
+		st, ts, err := parseStatusTLV(b)
 		if err != nil {
 			return nil, true, err
 		}
@@ -73,8 +66,9 @@ func DecodeMKGW4Auto(asciiOrBin []byte) (*Auto, bool, error) {
 		}
 		a.Timestamp = ts
 		return a, true, nil
-	case "3089", "30b1":
-		fx, ts, err := parseFixTLV(body)
+	case "3089", "30B1":
+		log.Printf("In case 3089/30B1")
+		fx, ts, err := parseFixTLV(b)
 		if err != nil {
 			return nil, true, err
 		}

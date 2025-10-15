@@ -2,10 +2,15 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"ble-gw-auto-parser/db"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -17,69 +22,168 @@ func New() *Store {
 	return &Store{pool: db.Pool} // uses the global Pool from db.Connect()
 }
 
-func (s *Store) UpsertAuto(
+// Update parsed JSON AND denormalized columns into the SAME row.
+func (s *Store) UpdateGatewayParsedAndDenormByID(
 	ctx context.Context,
-	gwHW string,
-	gwMAC []byte,
-	topic string,
-	flag string,
-	payloadHex string,
-	deviceTS time.Time,
-	st *AutoStatus, // from parser.go (redeclared here via type alias)
+	id int64,
+	parser string,
+	parsed any,
+	st *AutoStatus,
 	fx *AutoFix,
 ) error {
-	_, err := s.pool.Exec(ctx, `
-INSERT INTO gateway_auto_message
-(gw_hw, gw_mac, topic, flag, ts_device, payload_hex,
- network_type, csq, batt_mv, axis_x_mg, axis_y_mg, axis_z_mg, acc_status, imei, iccid,
- longitude, latitude, tac_lac, ci)
-VALUES
-($1,$2,$3,$4,$5,$6,
- $7,$8,$9,$10,$11,$12,$13,$14,
- $15,$16,$17,$18,$19)
-ON CONFLICT (gw_mac, flag, ts_device, payload_hex) DO NOTHING
-`,
-		gwHW, gwMAC, topic, flag, deviceTS, payloadHex,
-		nullText(st, func() string { return st.NetworkType }),
-		nullInt(st, func() int { return st.CSQ }),
-		nullInt(st, func() int { return st.BattmV }),
-		nullInt(st, func() int { return st.AxisXmg }),
-		nullInt(st, func() int { return st.AxisYmg }),
-		nullInt(st, func() int { return st.AxisZmg }),
-		nullInt(st, func() int { return st.AccStatus }),
-		nullText(st, func() string { return st.IMEI }),
-		nullText(st, func() string { return st.ICCID }),
-		nullFloat(fx, func() float64 { return fx.Longitude }),
-		nullFloat(fx, func() float64 { return fx.Latitude }),
-		nullInt(fx, func() int { return fx.TacLac }),
-		nullInt64(fx, func() int64 { return fx.CI }),
+	b, _ := json.Marshal(parsed)
+
+	// Precompute all nullable params as `any` so nil stays nil and COALESCE works.
+	var (
+		networkType any
+		csq         any
+		battmv      any
+		ax          any
+		ay          any
+		az          any
+		acc         any
+		imei        any
+		iccid       any
+
+		longitude any
+		latitude  any
+		taclac    any
+		ci        any
 	)
-	return err
+
+	if st != nil {
+		networkType = st.NetworkType
+		csq = st.CSQ
+		battmv = st.BattmV
+		ax = st.AxisXmg
+		ay = st.AxisYmg
+		az = st.AxisZmg
+		acc = st.AccStatus
+		imei = st.IMEI
+		iccid = st.ICCID
+	}
+	if fx != nil {
+		longitude = fx.Longitude
+		latitude = fx.Latitude
+		taclac = fx.TacLac
+		ci = fx.CI
+	}
+
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE public.gateway_message
+		SET
+			parser 			= $2,
+			parser_json 	= $3,
+			network_type 	= COALESCE($4, network_type),
+			csq 			= COALESCE($5, csq),
+			batt_mv 		= COALESCE($6, batt_mv),
+			axis_x_mg 		= COALESCE($7, axis_x_mg),
+			axis_y_mg 		= COALESCE($8, axis_y_mg),
+			axis_z_mg 		= COALESCE($9, axis_z_mg),
+			acc_status		= COALESCE($10, acc_status),
+			imei			= COALESCE($11, imei),
+			iccid 			= COALESCE($12, iccid),
+			longitude		= COALESCE($13, longitude),
+			latitude		= COALESCE($14, latitude),
+			tac				= COALESCE($15, tac),
+			cell_id			= COALESCE($16, cell_id)
+		WHERE id = $1
+		`, id, parser, json.RawMessage(b),
+		networkType, csq, battmv, ax, ay, az, acc, imei, iccid,
+		longitude, latitude, taclac, ci,
+	)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+
+	return nil
 }
 
-func nullText[T any](ptr *T, f func() string) any {
-	if ptr == nil {
-		return nil
+func (s *Store) UpdateGatewayParsedColumnsByID(
+	ctx context.Context, id int64, st *AutoStatus, fx *AutoFix,
+) error {
+	if st != nil {
+		if _, err := s.pool.Exec(ctx, `
+            UPDATE public.gateway_message
+            SET network_type = $2,
+                csq          = $3
+            WHERE id = $1
+        `, id, st.NetworkType, st.CSQ); err != nil {
+			return err
+		}
 	}
-	return f()
+	if fx != nil {
+		if _, err := s.pool.Exec(ctx, `
+            UPDATE public.gateway_message
+            SET longitude = $2,
+                latitude  = $3,
+                tac       = $4,
+                cell_id   = $5
+            WHERE id = $1
+        `, id, fx.Longitude, fx.Latitude, fx.TacLac, fx.CI); err != nil {
+			return err
+		}
+	}
+	return nil
 }
-func nullInt[T any](ptr *T, f func() int) any {
-	if ptr == nil {
-		return nil
+
+// Update parser output into the SAME row in public.gateway_message
+func (s *Store) UpdateGatewayParsedByID(ctx context.Context, id int64, parser string, parsed any) error {
+	b, _ := json.Marshal(parsed)
+	ct, err := s.pool.Exec(ctx, `
+        UPDATE public.gateway_message
+        SET parser = $2,
+            parser_json = $3
+        WHERE id = $1
+    `, id, parser, json.RawMessage(b))
+	if err != nil {
+		return err
 	}
-	return f()
+	if ct.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
 }
-func nullInt64[T any](ptr *T, f func() int64) any {
-	if ptr == nil {
-		return nil
+
+// Fallback lookup when RowID was not provided (avoid if possible).
+// Tries (gw_mac, ts_device, payload_hex) and, for JSON self-frames, raw_json->>'payload_hex'
+func (s *Store) FindGatewayRowID(ctx context.Context, gwMAC []byte, ts time.Time, payloadHex string) (int64, error) {
+	var id int64
+	// 1) direct (gw_mac, ts_device, payload_hex)
+	err := s.pool.QueryRow(ctx, `
+        SELECT id
+        FROM public.gateway_message
+        WHERE gw_mac = $1 AND ts_device = $2 AND payload_hex = $3
+        ORDER BY id DESC
+        LIMIT 1
+    `, gwMAC, ts, payloadHex).Scan(&id)
+	if err == nil {
+		return id, nil
 	}
-	return f()
-}
-func nullFloat[T any](ptr *T, f func() float64) any {
-	if ptr == nil {
-		return nil
+
+	// 2) JSON case: payload_hex column may be empty, but env is in raw_json
+	// Try to match by the original JSON string (minified) stored inside raw_json.
+	if payloadHex != "" && (strings.HasPrefix(payloadHex, "{") || strings.HasPrefix(payloadHex, "[")) {
+		err2 := s.pool.QueryRow(ctx, `
+            SELECT id
+            FROM public.gateway_message
+            WHERE gw_mac = $1 AND ts_device = $2
+              AND (payload_hex = '' OR payload_hex IS NULL)
+              AND raw_json->>'payload_hex' = $3
+            ORDER BY id DESC
+            LIMIT 1
+        `, gwMAC, ts, payloadHex).Scan(&id)
+		if err2 == nil {
+			return id, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) && !errors.Is(err2, pgx.ErrNoRows) {
+			return 0, fmt.Errorf("find id: %w; %v", err, err2)
+		}
 	}
-	return f()
+	return 0, pgx.ErrNoRows
 }
 
 // Type aliases to reuse parser types without import cycles (storage ↔ parser):
