@@ -22,75 +22,113 @@ func New() *Store {
 	return &Store{pool: db.Pool} // uses the global Pool from db.Connect()
 }
 
+// Type aliases to reuse parser types without import cycles (storage ↔ parser):
+type AutoStatus = struct {
+	NetworkType string
+	CSQ         int
+	BattmV      int
+	AxisXmg     int
+	AxisYmg     int
+	AxisZmg     int
+	AccStatus   int
+	IMEI        string
+	ICCID       string
+}
+type AutoFix = struct {
+	FixMode   string
+	FixResult string
+	Longitude float64
+	Latitude  float64
+	TacLac    int
+	CI        int64
+}
+
 // Update parsed JSON AND denormalized columns into the SAME row.
 func (s *Store) UpdateGatewayParsedAndDenormByID(
 	ctx context.Context,
 	id int64,
 	parser string,
 	parsed any,
+	deviceTs time.Time,
 	st *AutoStatus,
 	fx *AutoFix,
 ) error {
 	b, _ := json.Marshal(parsed)
 
 	// Precompute all nullable params as `any` so nil stays nil and COALESCE works.
+	// Build nullable values
 	var (
-		networkType any
-		csq         any
-		battmv      any
-		ax          any
-		ay          any
-		az          any
-		acc         any
-		imei        any
-		iccid       any
-
-		longitude any
-		latitude  any
-		taclac    any
-		ci        any
+		lat, lon *float64
+		tac, csq *int
+		ci       *int64
 	)
+	var netType, imei, iccid *string
+	var batt, ax, ay, az, acc *int
+
+	if fx != nil {
+		lon = &fx.Longitude
+		lat = &fx.Latitude
+		tac = &fx.TacLac
+		ci = &fx.CI
+	}
 
 	if st != nil {
-		networkType = st.NetworkType
-		csq = st.CSQ
-		battmv = st.BattmV
-		ax = st.AxisXmg
-		ay = st.AxisYmg
-		az = st.AxisZmg
-		acc = st.AccStatus
-		imei = st.IMEI
-		iccid = st.ICCID
-	}
-	if fx != nil {
-		longitude = fx.Longitude
-		latitude = fx.Latitude
-		taclac = fx.TacLac
-		ci = fx.CI
+		if st.NetworkType != "" {
+			netType = &st.NetworkType
+		}
+		if st.IMEI != "" {
+			imei = &st.IMEI
+		}
+		if st.ICCID != "" {
+			imei = &st.ICCID
+		}
+		c := st.CSQ
+		b := st.BattmV
+		x := st.AxisXmg
+		y := st.AxisYmg
+		z := st.AxisZmg
+		a := st.AccStatus
+
+		csq = &c
+		batt = &b
+		ax = &x
+		ay = &y
+		az = &z
+		acc = &a
 	}
 
+	// We update ts_device to decoded deviceTs if not zero.
+	var tsDev *time.Time
+	if !deviceTs.IsZero() {
+		tmp := deviceTs.UTC()
+		tsDev = &tmp
+	}
+
+	// Note: use COALESCE to allow nulls; we set explicitely whatever we have now.
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE public.gateway_message
-		SET
-			parser 			= $2,
-			parser_json 	= $3,
-			network_type 	= COALESCE($4, network_type),
-			csq 			= COALESCE($5, csq),
-			batt_mv 		= COALESCE($6, batt_mv),
-			axis_x_mg 		= COALESCE($7, axis_x_mg),
-			axis_y_mg 		= COALESCE($8, axis_y_mg),
-			axis_z_mg 		= COALESCE($9, axis_z_mg),
-			acc_status		= COALESCE($10, acc_status),
-			imei			= COALESCE($11, imei),
-			iccid 			= COALESCE($12, iccid),
-			longitude		= COALESCE($13, longitude),
-			latitude		= COALESCE($14, latitude),
-			tac				= COALESCE($15, tac),
-			cell_id			= COALESCE($16, cell_id)
+		SET 
+			parser			= $2,
+			parser_json		= $3,
+			ts_device		= COALESCE($4, ts_device),
+			latitude		= $5,
+			longitude		= $6,
+			tac				= $7,
+			cell_id			= $8,
+			network_type	= $9,
+			csq				= $10,
+			batt_mv			= $11,
+			axis_x_mg		= $12,
+			axis_y_mg		= $13,
+			axis_z_mg		= $14,
+			acc_status		= $15,
+			imei			= $16,
+			iccid			= $17
 		WHERE id = $1
-		`, id, parser, json.RawMessage(b),
-		networkType, csq, battmv, ax, ay, az, acc, imei, iccid,
-		longitude, latitude, taclac, ci,
+	`, id, parser, json.RawMessage(b),
+		tsDev,
+		lat, lon, tac, ci,
+		netType, csq, batt, ax, ay, az, acc, imei, iccid,
 	)
 	if err != nil {
 		return err
@@ -100,6 +138,7 @@ func (s *Store) UpdateGatewayParsedAndDenormByID(
 	}
 
 	return nil
+
 }
 
 func (s *Store) UpdateGatewayParsedColumnsByID(
@@ -184,25 +223,4 @@ func (s *Store) FindGatewayRowID(ctx context.Context, gwMAC []byte, ts time.Time
 		}
 	}
 	return 0, pgx.ErrNoRows
-}
-
-// Type aliases to reuse parser types without import cycles (storage ↔ parser):
-type AutoStatus = struct {
-	NetworkType string
-	CSQ         int
-	BattmV      int
-	AxisXmg     int
-	AxisYmg     int
-	AxisZmg     int
-	AccStatus   int
-	IMEI        string
-	ICCID       string
-}
-type AutoFix = struct {
-	FixMode   string
-	FixResult string
-	Longitude float64
-	Latitude  float64
-	TacLac    int
-	CI        int64
 }

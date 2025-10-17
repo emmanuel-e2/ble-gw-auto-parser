@@ -57,27 +57,35 @@ func DecodeMKGW4Auto(flagHex string, bodyHex string) (*Auto, bool, error) {
 	case "3004":
 		log.Printf("In case 3004")
 		st, ts, err := parseStatusTLV(b)
+
 		if err != nil {
 			return nil, true, err
 		}
+
 		a.Status = st
 		if ts == 0 {
 			ts = time.Now().Unix()
 		}
+
 		a.Timestamp = ts
 		return a, true, nil
+
 	case "3089", "30B1":
 		log.Printf("In case 3089/30B1")
 		fx, ts, err := parseFixTLV(b)
+
 		if err != nil {
 			return nil, true, err
 		}
+
 		a.Fix = fx
 		if ts == 0 {
 			ts = time.Now().Unix()
 		}
+
 		a.Timestamp = ts
 		return a, true, nil
+
 	default:
 		return nil, false, nil
 	}
@@ -88,11 +96,11 @@ func parseStatusTLV(body []byte) (*AutoStatus, int64, error) {
 	var ts int64
 	i := 0
 	for i < len(body) {
-		tag := body[i]
-		i++
-		if i+2 > len(body) {
+		if i+3 > len(body) {
 			return nil, 0, errors.New("status tlv len OOB")
 		}
+		tag := body[i]
+		i++
 		ln := be16(body[i:])
 		i += 2
 		if i+ln > len(body) {
@@ -125,12 +133,15 @@ func parseStatusTLV(body []byte) (*AutoStatus, int64, error) {
 			}
 		case 0x06: // IMEI (ASCII)
 			st.IMEI = string(body[i : i+ln])
+		case 0x07:
+			st.ICCID = string(body[i : i+ln])
 		}
 		i += ln
 	}
 	return st, ts, nil
 }
 
+// 3089/30B1 body parser
 var fixModeNames = []string{"Periodic", "Motion", "Downlink"}
 var fixResultNames = []string{
 	"GPS fix success", "LBS fix success", "Interrupted by Downlink",
@@ -142,11 +153,11 @@ func parseFixTLV(body []byte) (*AutoFix, int64, error) {
 	var ts int64
 	i := 0
 	for i < len(body) {
-		tag := body[i]
-		i++
-		if i+2 > len(body) {
+		if i+3 > len(body) {
 			return nil, 0, errors.New("fix tlv len OOB")
 		}
+		tag := body[i]
+		i++
 		ln := be16(body[i:])
 		i += 2
 		if i+ln > len(body) {
@@ -200,23 +211,7 @@ func onlyHex(s string) bool {
 	}
 	return true
 }
-func be16(b []byte) int   { return int(b[0])<<8 | int(b[1]) }
-func be32(b []byte) int64 { return int64(b[0])<<24 | int64(b[1])<<16 | int64(b[2])<<8 | int64(b[3]) }
 
-// ParseMAC12 converts "CCE01BA20624" -> []byte{0xCC,0xE0,0x1B,0xA2,0x06,0x24}
-func ParseMAC12(s string) ([]byte, error) {
-	s = strings.ToUpper(strings.TrimSpace(s))
-	if len(s) != 12 {
-		return nil, fmt.Errorf("mac must be 12 hex chars")
-	}
-	out := make([]byte, 6)
-	for i := 0; i < 6; i++ {
-		var v byte
-		_, err := fmt.Sscanf(s[i*2:i*2+2], "%02X", &v)
-		if err != nil {
-			return nil, fmt.Errorf("bad mac at %d: %w", i, err)
-		}
-		out[i] = v
-	}
-	return out, nil
-}
+func be16(b []byte) int { return int(b[0])<<8 | int(b[1]) }
+
+func be32(b []byte) int64 { return int64(b[0])<<24 | int64(b[1])<<16 | int64(b[2])<<8 | int64(b[3]) }

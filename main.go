@@ -133,60 +133,69 @@ func handleAuto(w http.ResponseWriter, r *http.Request) {
 	var st *storage.AutoStatus
 	var fx *storage.AutoFix
 
+	log.Printf("Entering the switch, flag=%s, env.GWHW=%s", flagToStore, env.GWHW)
 	switch env.GWHW {
 	case "MKGW4":
-		// We receive TLV BODY (no EF30 header). Use the provided flag.
-		// Extract bare flag from "self/3004" -> "3004"
-		bare := strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(strings.ToLower(flagToStore), "self/")))
-		if looksLikeHex(env.PayloadHex) && (bare == "3004" || bare == "3089" || bare == "30B1") {
-			auto, ok, decErr := DecodeMKGW4Auto(bare, env.PayloadHex)
-			// Debug head (trim to keep logs readable)
-			if decErr != nil {
-				log.Printf("decode warn (MKGW4 body): %v", decErr)
+		// Normalize TLV body (no EF30 header in our pipeline)
+		bodyHex := strings.ToUpper(strings.NewReplacer(" ", "", ":", "", "-", "", ".", "").Replace(env.PayloadHex))
+		payloadToStore = bodyHex
+
+		// Extract "3089" from "self/3089" (or "3004", "30B1", etc.)
+		rawFlag := strings.TrimSpace(flagToStore) // e.g. "self/3004"
+		flagUp := strings.ToUpper(rawFlag)        // "SELF/3004"
+		flagHex := strings.TrimPrefix(flagUp, "SELF/")
+
+		log.Printf("flagUp=%q flagHex=%q", flagUp, flagHex)
+		log.Printf("bodyHex=%q", bodyHex)
+
+		auto, ok, decErr := DecodeMKGW4Auto(flagHex, bodyHex)
+		log.Printf("auto=%v ok=%v decErr=%x", auto, ok, decErr)
+
+		if decErr != nil {
+			log.Printf("decode warn (MKGW4): %v", decErr)
+		}
+		if ok && auto != nil {
+			log.Printf("flagToStore=%s", flagToStore)
+			if flagToStore == "" {
+				flagToStore = "self/" + strings.ToUpper(auto.Flag)
 			}
-			if ok && auto != nil {
-				if flagToStore == "" {
-					flagToStore = "self/" + strings.ToUpper(auto.Flag)
+			payloadToStore = strings.ToUpper(auto.Hex)
+			log.Printf("payloadToStore=%s", payloadToStore)
+			log.Printf("auto.Timestamp=%d", auto.Timestamp)
+			if auto.Timestamp != 0 {
+				ts = time.Unix(auto.Timestamp, 0).UTC()
+			}
+			log.Printf("auto.Status=%x", auto.Status)
+			if auto.Status != nil {
+				st = &storage.AutoStatus{
+					NetworkType: auto.Status.NetworkType,
+					CSQ:         auto.Status.CSQ,
+					BattmV:      auto.Status.BattmV,
+					AxisXmg:     auto.Status.AxisXmg,
+					AxisYmg:     auto.Status.AxisYmg,
+					AxisZmg:     auto.Status.AxisZmg,
+					AccStatus:   auto.Status.AccStatus,
+					IMEI:        auto.Status.IMEI,
+					ICCID:       auto.Status.ICCID,
 				}
-				payloadToStore = strings.ToUpper(auto.Hex)
-				if auto.Timestamp != 0 && env.DeviceTsMs == 0 {
-					ts = time.Unix(auto.Timestamp, 0)
+			}
+			log.Printf("auto.Fix=%x", auto.Fix)
+			if auto.Fix != nil {
+				fx = &storage.AutoFix{
+					FixMode:   auto.Fix.FixMode,
+					FixResult: auto.Fix.FixResult,
+					Longitude: auto.Fix.Longitude,
+					Latitude:  auto.Fix.Latitude,
+					TacLac:    auto.Fix.TacLac,
+					CI:        auto.Fix.CI,
 				}
-				if auto.Status != nil {
-					st = &storage.AutoStatus{
-						NetworkType: auto.Status.NetworkType,
-						CSQ:         auto.Status.CSQ,
-						BattmV:      auto.Status.BattmV,
-						AxisXmg:     auto.Status.AxisXmg,
-						AxisYmg:     auto.Status.AxisYmg,
-						AxisZmg:     auto.Status.AxisZmg,
-						AccStatus:   auto.Status.AccStatus,
-						IMEI:        auto.Status.IMEI,
-						ICCID:       auto.Status.ICCID,
-					}
-				}
-				if auto.Fix != nil {
-					fx = &storage.AutoFix{
-						FixMode:   auto.Fix.FixMode,
-						FixResult: auto.Fix.FixResult,
-						Longitude: auto.Fix.Longitude,
-						Latitude:  auto.Fix.Latitude,
-						TacLac:    auto.Fix.TacLac,
-						CI:        auto.Fix.CI,
-					}
-				}
-			} else {
-				// Unknown/other MKGW4 body → store as-is
-				payloadToStore = strings.ToUpper(env.PayloadHex)
 			}
 		} else {
-			// Non-hex / unsupported flag: store as JSON flavor
 			if flagToStore == "" {
-				flagToStore = "json"
+				flagToStore = "self/" + flagHex
 			}
-			payloadToStore = env.PayloadHex
+			payloadToStore = bodyHex
 		}
-
 	default:
 		// JSON gateways (MKGW3/MKGW1BWPRO/MINI...). Store JSON body as-is.
 		if flagToStore == "" {
@@ -195,54 +204,62 @@ func handleAuto(w http.ResponseWriter, r *http.Request) {
 		payloadToStore = env.PayloadHex
 	}
 
-	// --- Update parsed view back into public.gateway_message if RowID present ---
-	if env.RowID != nil && *env.RowID > 0 {
-		parsed := map[string]any{
-			"gw_hw":        env.GWHW,
-			"gw_mac":       env.GWMAC,
-			"flag":         flagToStore,
-			"topic":        env.Topic,
-			"device_ts":    ts.UTC().Format(time.RFC3339Nano),
-			"device_ts_ms": ts.UnixMilli(),
-			"source":       "ble-gw-auto-parser",
-			"kind":         "gateway_self",
-			"version":      1,
+	// Build parsed view for gateway_parser_json
+	parsed := map[string]any{
+		"kind":         "gateway_self",
+		"version":      1,
+		"source":       "ble-gw-auto-parser",
+		"flag":         flagToStore,
+		"gw_hw":        env.GWHW,
+		"gw_mac":       env.GWMAC,
+		"topic":        env.Topic,
+		"device_ts":    ts.UTC().Format(time.RFC3339Nano),
+		"device_ts_ms": ts.UnixMilli(),
+	}
+	if st != nil {
+		parsed["status"] = map[string]any{
+			"network_type": st.NetworkType,
+			"csq":          st.CSQ,
+			"batt_mv":      st.BattmV,
+			"axis_x_mg":    st.AxisXmg,
+			"axis_y_mg":    st.AxisYmg,
+			"axis_z_mg":    st.AxisZmg,
+			"acc_status":   st.AccStatus,
+			"imei":         st.IMEI,
+			"iccid":        st.ICCID,
 		}
-		if st != nil {
-			parsed["status"] = map[string]any{
-				"network_type": st.NetworkType,
-				"csq":          st.CSQ,
-				"batt_mv":      st.BattmV,
-				"axis_x_mg":    st.AxisXmg,
-				"axis_y_mg":    st.AxisYmg,
-				"axis_z_mg":    st.AxisZmg,
-				"acc_status":   st.AccStatus,
-				"imei":         st.IMEI,
-				"iccid":        st.ICCID,
-			}
+	}
+	if fx != nil {
+		parsed["fix"] = map[string]any{
+			"mode":    fx.FixMode,
+			"result":  fx.FixResult,
+			"lon":     fx.Longitude,
+			"lat":     fx.Latitude,
+			"tac_lac": fx.TacLac,
+			"ci":      fx.CI,
 		}
-		if fx != nil {
-			parsed["fix"] = map[string]any{
-				"mode":    fx.FixMode,
-				"result":  fx.FixResult,
-				"lon":     fx.Longitude,
-				"lat":     fx.Latitude,
-				"tac_lac": fx.TacLac,
-				"ci":      fx.CI,
-			}
-		}
+	}
 
+	// Write back into SAME gateway_message row (parser + parser_json + denorm columns)
+	if env.RowID != nil && *env.RowID > 0 {
 		parserName := "gw_json:auto"
 		if env.GWHW == "MKGW4" {
 			parserName = "mkgw4:auto"
 		}
-		if err := store.UpdateGatewayParsedAndDenormByID(r.Context(), *env.RowID, parserName, parsed, st, fx); err != nil {
-			// Not fatal; continue to publish.
-			log.Printf("UpdateGatewayParsedAndDenormByID err (id=%d): %v", *env.RowID, err)
+		if err := store.UpdateGatewayParsedAndDenormByID(
+			r.Context(),
+			*env.RowID,
+			parserName,
+			parsed,
+			ts,
+			st,
+			fx,
+		); err != nil {
+			log.Printf("UpdateGatewayParsedAndDenormID err (id=%d): %v", *env.RowID, err)
 		}
 	}
 
-	// --- Publish parsed message to Pub/Sub (optional) ---
+	// Publish
 	if psTopic != nil {
 		out := map[string]any{
 			"type":          "gateway_self",
@@ -251,10 +268,10 @@ func handleAuto(w http.ResponseWriter, r *http.Request) {
 			"flag":          flagToStore,
 			"topic":         env.Topic,
 			"device_ts_ms":  ts.UnixMilli(),
-			"payload":       payloadToStore, // MKGW4: hex body; JSON GWs: JSON string
-			"row_id":        env.RowID,      // may be nil
-			"parsed_status": st,             // may be nil
-			"parsed_fix":    fx,             // may be nil
+			"payload":       payloadToStore,
+			"row_id":        env.RowID,
+			"parsed_status": st,
+			"parsed_fix":    fx,
 		}
 		b, _ := json.Marshal(out)
 
@@ -262,8 +279,10 @@ func handleAuto(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 
 		res := psTopic.Publish(ctx, &pubsub.Message{
-			Data:       b,
-			Attributes: map[string]string{"source": "ble-gw-auto-parser"},
+			Data: b,
+			Attributes: map[string]string{
+				"source": "ble-gw-auto-parser",
+			},
 		})
 		if _, err := res.Get(ctx); err != nil {
 			log.Printf("pubsub publish error: %v", err)
